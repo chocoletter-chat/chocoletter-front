@@ -6,6 +6,7 @@
     <div v-if="!username || !nickname || !roomId">
       <input v-model="tempUsername" placeholder="사용자 ID를 입력하세요..." />
       <input v-model="tempNickname" placeholder="닉네임을 입력하세요..." />
+      <input v-model="tempToken" placeholder="토큰을 입력하세요..." />
       <input v-model="tempRoomId" placeholder="채팅방 ID를 입력하세요..." />
       <button @click="setUserInfo">확인</button>
     </div>
@@ -19,14 +20,23 @@
       <button class="disconnect-btn" @click="disconnectStomp">연결 종료</button>
 
       <div class="chat-box">
-        <div v-for="(msg, index) in messages" :key="index" class="message">
+        <div
+          v-for="(msg, index) in messages.filter(
+            (m) => m.messageType !== 'READ_STATUS'
+          )"
+          :key="index"
+          class="message"
+        >
           <span class="sender">{{ msg.senderName }} ({{ msg.senderId }}):</span>
           {{ msg.content }}
           <span class="timestamp">
             {{ formatTimestamp(msg.createdAt) }}
-            <span v-if="msg.isRead === false" class="unread-indicator">
-              안읽음</span
-            >
+            <span v-if="msg.senderId == username">
+              <span v-if="msg.isRead === false" class="unread-indicator"
+                >안읽음</span
+              >
+              <span v-else class="unread-indicator">읽음</span>
+            </span>
           </span>
         </div>
       </div>
@@ -54,9 +64,11 @@ const stompClient = ref(null); // STOMP 클라이언트
 const tempUsername = ref(""); // 임시 사용자 ID
 const tempNickname = ref(""); // 임시 닉네임
 const tempRoomId = ref(""); // 임시 채팅방 ID
+const tempToken = ref(""); // 임시 토큰
 const username = ref(localStorage.getItem("username") || ""); // 사용자 ID
 const nickname = ref(localStorage.getItem("nickname") || ""); // 닉네임
 const roomId = ref(localStorage.getItem("roomId") || ""); // 채팅방 ID
+const token = ref(localStorage.getItem("token") || ""); // 채팅방 ID
 
 // 기존 채팅 기록 불러오기
 const fetchChatHistory = async () => {
@@ -77,15 +89,18 @@ const setUserInfo = () => {
   if (
     tempUsername.value.trim() === "" ||
     tempNickname.value.trim() === "" ||
-    tempRoomId.value.trim() === ""
+    tempRoomId.value.trim() === "" ||
+    tempToken.value.trim() === ""
   )
     return;
   username.value = tempUsername.value.trim();
   nickname.value = tempNickname.value.trim();
   roomId.value = tempRoomId.value.trim();
+  token.value = tempToken.value.trim();
   localStorage.setItem("username", username.value);
   localStorage.setItem("nickname", nickname.value);
   localStorage.setItem("roomId", roomId.value);
+  localStorage.setItem("token", token.value);
   fetchChatHistory();
   connectStomp();
 };
@@ -95,6 +110,9 @@ const connectStomp = () => {
   stompClient.value = new Client({
     brokerURL: "ws://localhost:8080/chat", // STOMP 서버 주소
     reconnectDelay: 5000, // 재연결 대기 시간 (5초)
+    connectHeaders: {
+      Authorization: "Bearer " + token.value,
+    },
     onConnect: () => {
       console.log("✅ STOMP 연결 성공");
       subscribeToRoom();
@@ -109,51 +127,48 @@ const connectStomp = () => {
   stompClient.value.activate();
 };
 
-// 채팅방 구독
 const subscribeToRoom = () => {
   if (!stompClient.value || !stompClient.value.connected) {
     console.error("🚨 STOMP 연결되지 않음. 구독 불가능.");
     return;
   }
 
-  stompClient.value.subscribe(`/topic/${roomId.value}`, (message) => {
-    console.log("📩 새 메시지 수신:", message.body);
-    try {
-      const receivedMessage = JSON.parse(message.body);
+  const destination = `/topic/${roomId.value}`; // 동적 roomId 적용
+  const headers = {
+    Authorization: `Bearer ${token.value}`, // 인증 토큰 추가
+  };
 
-      if (
-        receivedMessage.messageType &&
-        receivedMessage.senderId &&
-        receivedMessage.senderName &&
-        receivedMessage.content &&
-        receivedMessage.createdAt &&
-        receivedMessage.isRead !== undefined // `false` 값도 허용
-      ) {
-        if (receivedMessage.messageType === "CHAT") {
-          messages.value = [...messages.value, receivedMessage]; // Vue 반응형 업데이트 보장
-        } else {
-          console.log(
-            "🔄 메시지 타입이 CHAT이 아님, 채팅 기록 다시 불러오기..."
-          );
-          fetchChatHistory(); // 메시지 타입이 CHAT이 아니면 다시 채팅 기록 불러오기
+  stompClient.value.subscribe(
+    destination,
+    (message) => {
+      console.log("📩 새 메시지 수신:", message.body);
+      try {
+        const receivedMessage = JSON.parse(message.body);
+
+        if (receivedMessage.messageType) {
+          if (receivedMessage.messageType === "CHAT") {
+            messages.value = [...messages.value, receivedMessage];
+          } else if (receivedMessage.messageType === "READ_STATUS") {
+            fetchChatHistory();
+          }
         }
-      } else {
-        console.error("🚨 메시지 형식이 올바르지 않음:", receivedMessage);
+      } catch (error) {
+        console.error("❌ 메시지 JSON 파싱 오류:", error);
       }
-    } catch (error) {
-      console.error("❌ 메시지 JSON 파싱 오류:", error);
-    }
-  });
+    },
+    headers
+  ); // ✅ 헤더 추가
 
-  console.log(`✅ 채팅방 구독 완료: /topic/${roomId.value}`);
+  console.log(`✅ 채팅방 구독 완료: ${destination}`);
 };
 
 // 메시지 전송
 const sendMessage = () => {
   if (message.value.trim() === "" || !stompClient.value.connected) return;
   const msgObject = {
+    messageType: "CHAT",
     roomId: roomId.value,
-    senderId: Number(username.value), // 숫자로 변환
+    senderId: username.value,
     senderName: nickname.value,
     content: message.value,
   };
@@ -161,23 +176,43 @@ const sendMessage = () => {
   stompClient.value.publish({
     destination: `/app/send`,
     body: JSON.stringify(msgObject),
+    headers: {
+      Authorization: `Bearer ${token.value}`, // 🔥 여기에서 헤더 추가
+    },
   });
   message.value = "";
 };
 
-// STOMP 연결 종료
-const disconnectStomp = () => {
-  if (stompClient.value) {
-    stompClient.value.deactivate();
-    console.log("🔴 STOMP 연결 종료됨");
+const disconnectStomp = async () => {
+  try {
+    // REST API 호출로 채팅방 연결 끊기
+    await axios.post(
+      `http://localhost:8080/api/v1/chat/${roomId.value}/${username.value}/disconnect`
+    );
+
+    // STOMP 클라이언트 연결 종료
+    if (stompClient.value) {
+      stompClient.value.deactivate();
+      console.log("🔴 STOMP 연결 종료됨");
+    }
+
+    // 상태 및 로컬 스토리지 초기화
+    username.value = "";
+    nickname.value = "";
+    roomId.value = "";
+    messages.value = [];
+    localStorage.removeItem("username");
+    localStorage.removeItem("nickname");
+    localStorage.removeItem("roomId");
+  } catch (error) {
+    // API 호출 실패 시 처리
+    console.error("채팅방 연결 끊기 실패:", error);
+
+    // 옵션: 에러 발생해도 STOMP 연결은 종료
+    if (stompClient.value) {
+      stompClient.value.deactivate();
+    }
   }
-  username.value = "";
-  nickname.value = "";
-  roomId.value = "";
-  messages.value = [];
-  localStorage.removeItem("username");
-  localStorage.removeItem("nickname");
-  localStorage.removeItem("roomId");
 };
 
 // 타임스탬프 포맷
